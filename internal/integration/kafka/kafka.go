@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
+	"io/ioutil"
 	"text/template"
 	"time"
 
@@ -51,6 +53,20 @@ func New(m marshaler.Type, conf config.IntegrationKafkaConfig) (*Integration, er
 	if conf.TLS {
 		wc.Dialer.TLS = &tls.Config{
 			InsecureSkipVerify: conf.TLSInsecure,
+		}
+		if conf.RootCAPath != "" {
+			rootCAs, _ := x509.SystemCertPool()
+			if rootCAs == nil {
+				rootCAs = x509.NewCertPool()
+			}
+			certs, err := ioutil.ReadFile(conf.RootCAPath)
+			if err != nil {
+				return nil, errors.Wrap(err, "Error reading certs from" + conf.RootCAPath)
+			}
+			if ok := rootCAs.AppendCertsFromPEM(certs); !ok {
+				return nil, errors.Errorf("Can not add root ca")
+			}
+			wc.Dialer.TLS.RootCAs = rootCAs
 		}
 	}
 

@@ -221,6 +221,7 @@ type IntegrationKafkaConfig struct {
 	TLS              bool     `mapstructure:"tls"`
 	TLSInsecure      bool     `mapstructure:"tls_insecure"`
 	Topic            string   `mapstructure:"topic"`
+	RootCAPath       string   `mapstructure:"root_ca_path"`
 	EventKeyTemplate string   `mapstructure:"event_key_template"`
 	Username         string   `mapstructure:"username"`
 	Password         string   `mapstructure:"password"`
