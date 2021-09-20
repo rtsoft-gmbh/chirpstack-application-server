@@ -219,6 +219,7 @@ type IntegrationAMQPConfig struct {
 type IntegrationKafkaConfig struct {
 	Brokers          []string `mapstructure:"brokers"`
 	TLS              bool     `mapstructure:"tls"`
+	TLSInsecure      bool     `mapstructure:"tls_insecure"`
 	Topic            string   `mapstructure:"topic"`
 	EventKeyTemplate string   `mapstructure:"event_key_template"`
 	Username         string   `mapstructure:"username"`

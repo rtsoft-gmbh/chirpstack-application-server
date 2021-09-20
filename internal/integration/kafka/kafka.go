@@ -49,7 +49,9 @@ func New(m marshaler.Type, conf config.IntegrationKafkaConfig) (*Integration, er
 	}
 
 	if conf.TLS {
-		wc.Dialer.TLS = &tls.Config{}
+		wc.Dialer.TLS = &tls.Config{
+			InsecureSkipVerify: conf.TLSInsecure,
+		}
 	}
 
 	if conf.Username != "" || conf.Password != "" {
@@ -189,6 +191,13 @@ func (i *Integration) publish(ctx context.Context, applicationID uint64, devEUIB
 	}).Info("integration/kafka: publishing message")
 
 	if err := i.writer.WriteMessages(ctx, kmsg); err != nil {
+		if we, ok := err.(kafka.WriteErrors); ok {
+			reportString := ""
+			for count := 0; count < we.Count(); count++ {
+				reportString += "[" + we[count].Error() + "]   "
+			}
+			return errors.Wrap(err, "writing message to kafka. Errors: " + reportString)
+		}
 		return errors.Wrap(err, "writing message to kafka")
 	}
 	return nil
