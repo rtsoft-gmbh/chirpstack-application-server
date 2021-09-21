@@ -14,6 +14,7 @@ import (
 	"path"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/golang/protobuf/proto"
@@ -76,9 +77,10 @@ func (ch *certsHandler) updateRootCertificate() {
 	rootCAPath := path.Join(certsPath, rootCAFileName)
 	info, err := os.Stat(rootCAPath)
 	if os.IsNotExist(err) {
+		ch.rootCAPem = nil
 		return
 	}
-	if info.ModTime() == ch.rootCAModifyTime {
+	if info.ModTime() == ch.rootCAModifyTime && ch.rootCAPem != nil {
 		return
 	}
 	content, err := ioutil.ReadFile(rootCAPath)
@@ -100,13 +102,14 @@ func (ch *certsHandler) updateTLSCertificate() {
 	keyPath := path.Join(certsPath, tlsKeyFileName)
 	certInfo, err := os.Stat(certPath)
 	if os.IsNotExist(err) {
+		ch.crt = nil
 		return
 	}
 	keyInfo, err := os.Stat(keyPath)
 	if os.IsNotExist(err) {
 		return
 	}
-	if certInfo.ModTime() == ch.certModifyTime && keyInfo.ModTime() == ch.keyModifyTime {
+	if certInfo.ModTime() == ch.certModifyTime && keyInfo.ModTime() == ch.keyModifyTime && ch.crt != nil {
 		return
 	}
 	certContent, err := ioutil.ReadFile(certPath)
@@ -134,44 +137,58 @@ func (ch *certsHandler) updateTLSCertificate() {
 	}).Info("tls certificate updated")
 }
 
+func (ch *certsHandler) getTLSCertificate() *tls.Certificate {
+	ch.updateTLSCertificate()
+	return ch.crt
+}
+
+func (ch *certsHandler) getRootCAPem() *string {
+	ch.updateRootCertificate()
+	return ch.rootCAPem
+}
+
 // Integration implements a HTTP integration.
 type Integration struct {
 	marshaler marshaler.Type
 	config    Config
 	handler   certsHandler
+	mutex     *sync.Mutex
 }
 
-func (i *Integration) updateCertificates(scheme string) {
-	if scheme != "https" {
-		return
+func (i *Integration) getHTTPClient(scheme string) *http.Client {
+	client := &http.Client{
+		Timeout:   i.config.Timeout,
 	}
-	i.handler.updateRootCertificate()
-	i.handler.updateTLSCertificate()
-}
+	if scheme != "https" {
+		return client
+	}
 
-func (i *Integration) getHTTPClient() *http.Client {
 	transport := &http.Transport{
 		TLSHandshakeTimeout: 60 * time.Second,
 		TLSClientConfig:     &tls.Config{},
 	}
-	if i.handler.crt != nil {
-		transport.TLSClientConfig.Certificates = []tls.Certificate{*i.handler.crt}
+
+	i.mutex.Lock()
+	crt := i.handler.getTLSCertificate()
+	rootCa := i.handler.getRootCAPem()
+	i.mutex.Unlock()
+
+	if crt != nil {
+		transport.TLSClientConfig.Certificates = []tls.Certificate{*crt}
 	}
-	if i.handler.rootCAPem != nil {
+	if rootCa != nil {
 		rootCAs, _ := x509.SystemCertPool()
 		if rootCAs == nil {
 			rootCAs = x509.NewCertPool()
 		}
-		if ok := rootCAs.AppendCertsFromPEM([]byte(*i.handler.rootCAPem)); ok {
+		if ok := rootCAs.AppendCertsFromPEM([]byte(*rootCa)); ok {
 			transport.TLSClientConfig.RootCAs = rootCAs
 		} else {
 			log.Error("Can not add root certificate")
 		}
 	}
-	return &http.Client{
-		Timeout:   i.config.Timeout,
-		Transport: transport,
-	}
+	client.Transport = transport
+	return client
 }
 
 // New creates a new HTTP integration.
@@ -195,16 +212,17 @@ func New(m marshaler.Type, conf Config) (*Integration, error) {
 		marshaler: m,
 		config:    conf,
 		handler:   certsHandler{},
+		mutex:     &sync.Mutex{},
 	}, nil
 }
 
-func (i *Integration) send(u string, msg proto.Message) error {
+func (i *Integration) send(uu *url.URL, msg proto.Message) error {
 	b, err := marshaler.Marshal(i.marshaler, msg)
 	if err != nil {
 		return errors.Wrap(err, "marshal json error")
 	}
 
-	req, err := http.NewRequest("POST", u, bytes.NewReader(b))
+	req, err := http.NewRequest("POST", uu.String(), bytes.NewReader(b))
 	if err != nil {
 		return errors.Wrap(err, "new request error")
 	}
@@ -219,7 +237,7 @@ func (i *Integration) send(u string, msg proto.Message) error {
 		req.Header.Set(k, v)
 	}
 
-	client := i.getHTTPClient()
+	client := i.getHTTPClient(uu.Scheme)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -249,20 +267,18 @@ func (i *Integration) sendEvent(ctx context.Context, eventType, u string, devEUI
 
 	args := uu.Query()
 	args.Set("event", eventType)
-	u = fmt.Sprintf("%s://%s%s?%s", uu.Scheme, uu.Host, uu.Path, args.Encode())
-
-	i.updateCertificates(uu.Scheme)
+	uu.RawQuery = args.Encode()
 
 	log.WithFields(log.Fields{
-		"url":        u,
+		"url":        uu.String(),
 		"dev_eui":    devEUI,
 		"ctx_id":     ctx.Value(logging.ContextIDKey),
 		"event_type": eventType,
 	}).Info("integration/http: publishing event")
 
-	if err := i.send(u, msg); err != nil {
+	if err := i.send(uu, msg); err != nil {
 		log.WithError(err).WithFields(log.Fields{
-			"url":        u,
+			"url":        uu.String(),
 			"dev_eui":    devEUI,
 			"ctx_id":     ctx.Value(logging.ContextIDKey),
 			"event_type": eventType,
