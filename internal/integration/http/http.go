@@ -4,9 +4,14 @@ package http
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
+	"io/ioutil"
 	"net/http"
 	"net/url"
+	"os"
+	"path"
 	"regexp"
 	"strings"
 	"time"
@@ -20,6 +25,13 @@ import (
 	"github.com/brocaar/chirpstack-application-server/internal/integration/models"
 	"github.com/brocaar/chirpstack-application-server/internal/logging"
 	"github.com/brocaar/lorawan"
+)
+
+const (
+	certsPath       = "/data/integration/http"
+	rootCAFileName  = "ca.pem"
+	tlsCertFileName = "cert.pem"
+	tlsKeyFileName  = "key.pem"
 )
 
 var headerNameValidator = regexp.MustCompile(`^[A-Za-z0-9-]+$`)
@@ -52,10 +64,114 @@ func (c Config) Validate() error {
 	return nil
 }
 
+type certsHandler struct {
+	crt              *tls.Certificate
+	certModifyTime   time.Time
+	keyModifyTime    time.Time
+	rootCAPem        *string
+	rootCAModifyTime time.Time
+}
+
+func (ch *certsHandler) updateRootCertificate() {
+	rootCAPath := path.Join(certsPath, rootCAFileName)
+	info, err := os.Stat(rootCAPath)
+	if os.IsNotExist(err) {
+		return
+	}
+	if info.ModTime() == ch.rootCAModifyTime {
+		return
+	}
+	content, err := ioutil.ReadFile(rootCAPath)
+	if err != nil {
+		log.WithError(err).Error("Can not read rootCA")
+		return
+	}
+	pem := string(content)
+	ch.rootCAPem = &pem
+	ch.rootCAModifyTime = info.ModTime()
+
+	log.WithFields(log.Fields{
+		"rootCAModifyTime": ch.rootCAModifyTime,
+	}).Info("root certificate updated")
+}
+
+func (ch *certsHandler) updateTLSCertificate() {
+	certPath := path.Join(certsPath, tlsCertFileName)
+	keyPath := path.Join(certsPath, tlsKeyFileName)
+	certInfo, err := os.Stat(certPath)
+	if os.IsNotExist(err) {
+		return
+	}
+	keyInfo, err := os.Stat(keyPath)
+	if os.IsNotExist(err) {
+		return
+	}
+	if certInfo.ModTime() == ch.certModifyTime && keyInfo.ModTime() == ch.keyModifyTime {
+		return
+	}
+	certContent, err := ioutil.ReadFile(certPath)
+	if err != nil {
+		log.WithError(err).Error("Can not read tlsCertificate")
+		return
+	}
+	keyContent, err := ioutil.ReadFile(keyPath)
+	if err != nil {
+		log.WithError(err).Error("Can not read tlsKey")
+		return
+	}
+	crt, err := tls.X509KeyPair(certContent, keyContent)
+	if err != nil {
+		log.WithError(err).Error("Can not create x509Keypair with given PEMs")
+		return
+	}
+	ch.crt = &crt
+	ch.certModifyTime = certInfo.ModTime()
+	ch.keyModifyTime = keyInfo.ModTime()
+
+	log.WithFields(log.Fields{
+		"certModifyTime": ch.certModifyTime,
+		"keyModifyTime":  ch.keyModifyTime,
+	}).Info("tls certificate updated")
+}
+
 // Integration implements a HTTP integration.
 type Integration struct {
 	marshaler marshaler.Type
 	config    Config
+	handler   certsHandler
+}
+
+func (i *Integration) updateCertificates(scheme string) {
+	if scheme != "https" {
+		return
+	}
+	i.handler.updateRootCertificate()
+	i.handler.updateTLSCertificate()
+}
+
+func (i *Integration) getHTTPClient() *http.Client {
+	transport := &http.Transport{
+		TLSHandshakeTimeout: 60 * time.Second,
+		TLSClientConfig:     &tls.Config{},
+	}
+	if i.handler.crt != nil {
+		transport.TLSClientConfig.Certificates = []tls.Certificate{*i.handler.crt}
+	}
+	if i.handler.rootCAPem != nil {
+		rootCAs, _ := x509.SystemCertPool()
+		if rootCAs == nil {
+			rootCAs = x509.NewCertPool()
+		}
+		if ok := rootCAs.AppendCertsFromPEM([]byte(*i.handler.rootCAPem)); ok {
+			transport.TLSClientConfig.RootCAs = rootCAs
+		} else {
+			log.Error("Can not add root certificate")
+		}
+	}
+	return &http.Client{
+		Timeout:   i.config.Timeout,
+		Transport: transport,
+	}
 }
 
 // New creates a new HTTP integration.
@@ -78,6 +194,7 @@ func New(m marshaler.Type, conf Config) (*Integration, error) {
 	return &Integration{
 		marshaler: m,
 		config:    conf,
+		handler:   certsHandler{},
 	}, nil
 }
 
@@ -102,9 +219,7 @@ func (i *Integration) send(u string, msg proto.Message) error {
 		req.Header.Set(k, v)
 	}
 
-	client := &http.Client{
-		Timeout: i.config.Timeout,
-	}
+	client := i.getHTTPClient()
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -135,6 +250,8 @@ func (i *Integration) sendEvent(ctx context.Context, eventType, u string, devEUI
 	args := uu.Query()
 	args.Set("event", eventType)
 	u = fmt.Sprintf("%s://%s%s?%s", uu.Scheme, uu.Host, uu.Path, args.Encode())
+
+	i.updateCertificates(uu.Scheme)
 
 	log.WithFields(log.Fields{
 		"url":        u,
