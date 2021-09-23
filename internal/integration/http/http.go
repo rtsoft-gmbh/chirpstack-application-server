@@ -155,9 +155,9 @@ type Integration struct {
 	mutex     *sync.Mutex
 }
 
-func (i *Integration) getHTTPClient(scheme string) *http.Client {
+func (i *Integration) getHTTPClient(scheme string, insecure bool) *http.Client {
 	client := &http.Client{
-		Timeout:   i.config.Timeout,
+		Timeout: i.config.Timeout,
 	}
 	if scheme != "https" {
 		return client
@@ -187,6 +187,8 @@ func (i *Integration) getHTTPClient(scheme string) *http.Client {
 			log.Error("Can not add root certificate")
 		}
 	}
+	transport.TLSClientConfig.InsecureSkipVerify = insecure
+
 	client.Transport = transport
 	return client
 }
@@ -232,12 +234,16 @@ func (i *Integration) send(uu *url.URL, msg proto.Message) error {
 	} else {
 		req.Header.Set("Content-Type", "application/json")
 	}
-
+	insecure := false
 	for k, v := range i.config.Headers {
+		if k == "insecure" {
+			insecure = true
+			continue
+		}
 		req.Header.Set(k, v)
 	}
 
-	client := i.getHTTPClient(uu.Scheme)
+	client := i.getHTTPClient(uu.Scheme, insecure)
 
 	resp, err := client.Do(req)
 	if err != nil {
